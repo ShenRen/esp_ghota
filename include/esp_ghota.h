@@ -31,16 +31,33 @@ typedef enum
     GHOTA_EVENT_PENDING_REBOOT = 0x800, /*!< Github OTA pending reboot */
 } ghota_event_e;
 
+/** 
+ * @brief Git hosting platforms or services
+ * These events are posted to the event loop to track progress of the OTA process
+ */
+typedef enum
+{
+    GHOTA_HOST_CUSTOM = 0x00,
+    GHOTA_HOST_GITHUB = 0x01, /*!< GitHub open-source platform*/
+    GHOTA_HOST_GITEE = 0x02, /*!< Gitee, Git-based code hosting and R&D collaboration platform*/
+} ghota_host_e;
+
+struct ghota_config_t;
+typedef esp_err_t (*ghota_apiurlformat_callback_fn)(char* url_buf, size_t url_size, const struct ghota_config_t * ghota_config);
+
 /**
  * @brief Github OTA Configuration
  */
 typedef struct ghota_config_t {
-    char filenamematch[CONFIG_MAX_FILENAME_LEN]; /*!< Filename to match against on Github indicating this is a firmware file */
+    char firmwarenamematch[CONFIG_MAX_FILENAME_LEN]; /*!< Filename to match against on Github indicating this is a firmware file */
     char storagenamematch[CONFIG_MAX_FILENAME_LEN]; /*!< Filename to match against on Github indicating this is a storage file */
     char storagepartitionname[17]; /*!< Name of the storage partition to update */
+    ghota_host_e githost; /*!< Git hosting platform*/
     char *hostname; /*!< Hostname of the Github server. Defaults to api.github.com*/
-    char *orgname; /*!< Name of the Github organization */
+    char *onwername; /*!< Name of the Github onwer or organization */
     char *reponame; /*!< Name of the Github repository */
+    void * userdata; /*!< User data */
+    ghota_apiurlformat_callback_fn apiurlformatcb; /*!< Format of the Git API access url. Defaults to https://%s/repos/%s/%s/releases/latest*/
     uint32_t updateInterval; /*!< Interval in Minutes to check for updates if using the ghota_start_update_timer function */
 } ghota_config_t;
 

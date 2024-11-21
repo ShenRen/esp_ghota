@@ -1,9 +1,9 @@
 # Version of the component [Required, if not passed during upload]
-version: "1.1.1"
+version: "1.2.0"
 # Short description for the project [Recommended]
-description: esp32 OTA Component to update firmware from Github Releases
+description: esp32 OTA Component to update firmware from Github and Gitee Releases
 # Github repo or a home  [Recommended]
-url: https://github.com/Fishwaldo/esp_ghota
+url: https://github.com/ShenRen/esp_ghota
 
 # List of dependencies [Optional]
 # All dependencies of the component should be published in the same registry.

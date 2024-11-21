@@ -17,6 +17,9 @@
 #include "esp_ghota.h"
 #include "lwjson.h"
 
+#define GHOTA_HOSTNAME_GITHUB "api.github.com"
+#define GHOTA_HOSTNAME_GITEE "gitee.com"
+
 static const char *TAG = "GHOTA";
 
 ESP_EVENT_DEFINE_BASE(GHOTA_EVENTS);
@@ -34,8 +37,9 @@ typedef struct ghota_client_handle_t
     struct
     {
         char tag_name[CONFIG_MAX_FILENAME_LEN];
-        char name[CONFIG_MAX_FILENAME_LEN];
-        char url[CONFIG_MAX_URL_LEN];
+        char firmwarename[CONFIG_MAX_FILENAME_LEN];
+        char firmwareurl[CONFIG_MAX_URL_LEN];
+        char storagename[CONFIG_MAX_FILENAME_LEN];
         char storageurl[CONFIG_MAX_URL_LEN];
         uint8_t flags;
     } result;
@@ -57,7 +61,7 @@ enum release_flags
     GHOTA_RELEASE_GOT_FNAME = 0x02,
     GHOTA_RELEASE_GOT_URL = 0x04,
     GHOTA_RELEASE_GOT_STORAGE = 0x08,
-    GHOTA_RELEASE_VALID_ASSET = 0x10,
+    GHOTA_RELEASE_GOT_FIRMWARE = 0x10,
 } release_flags;
 
 SemaphoreHandle_t ghota_lock = NULL;
@@ -76,8 +80,36 @@ static void ClearFlag(ghota_client_handle_t *handle, enum release_flags flag)
     handle->result.flags &= ~flag;
 }
 
+// GitHub REST API url format callback
+static esp_err_t ghota_apiurlformat_github(char* url_buf, size_t url_size, const struct ghota_config_t * ghota_config)
+{
+    snprintf(url_buf, url_size, "https://%s/repos/%s/%s/releases/latest", ghota_config->hostname, ghota_config->onwername, ghota_config->reponame);
+    return ESP_OK;
+}
+
+// Gitee Open API url format callback
+static esp_err_t ghota_apiurlformat_gitee(char* url_buf, size_t url_size, const struct ghota_config_t * ghota_config)
+{
+    snprintf(url_buf, url_size, "https://%s/api/v5/repos/%s/%s/releases/latest", ghota_config->hostname, ghota_config->onwername, ghota_config->reponame);
+    return ESP_OK;
+}
+
+
 ghota_client_handle_t *ghota_init(ghota_config_t *newconfig)
 {
+
+    if(newconfig->githost == GHOTA_HOST_CUSTOM && newconfig->apiurlformatcb == NULL)
+    {
+        ESP_LOGE(TAG, "No apiurlformat callback function is provided.");
+        return NULL;
+    }
+
+    if(newconfig->githost == GHOTA_HOST_CUSTOM && newconfig->hostname == NULL)
+    {
+        ESP_LOGE(TAG, "No hostname is provided.");
+        return NULL;
+    }
+
     if (!ghota_lock)
     {
         ghota_lock = xSemaphoreCreateMutex();
@@ -95,23 +127,66 @@ ghota_client_handle_t *ghota_init(ghota_config_t *newconfig)
         return NULL;
     }
     bzero(handle, sizeof(ghota_client_handle_t));
-    strncpy(handle->config.filenamematch, newconfig->filenamematch, CONFIG_MAX_FILENAME_LEN);
+    strncpy(handle->config.firmwarenamematch, newconfig->firmwarenamematch, CONFIG_MAX_FILENAME_LEN);
     strncpy(handle->config.storagenamematch, newconfig->storagenamematch, CONFIG_MAX_FILENAME_LEN);
     strncpy(handle->config.storagepartitionname, newconfig->storagepartitionname, 17);
-    if (newconfig->hostname == NULL)
-        asprintf(&handle->config.hostname, CONFIG_GITHUB_HOSTNAME);
-    else
+    
+    if(newconfig->githost == GHOTA_HOST_CUSTOM){
+        //Try matching git host platform by hostname
+        if(newconfig->hostname && strcasecmp(newconfig->hostname,GHOTA_HOSTNAME_GITHUB) == 0){
+            handle->config.githost = GHOTA_HOST_GITHUB;
+        } else if(newconfig->hostname && strcasecmp(newconfig->hostname,GHOTA_HOSTNAME_GITEE) == 0){
+            handle->config.githost = GHOTA_HOST_GITEE;
+        } else {
+            handle->config.githost = GHOTA_HOST_CUSTOM;
+        }
+    } else {
+        handle->config.githost = newconfig->githost;
+    }
+    
+    if (newconfig->hostname == NULL){
+        // Determine host
+        if(handle->config.githost == GHOTA_HOST_GITHUB){
+            asprintf(&handle->config.hostname, GHOTA_HOSTNAME_GITHUB);
+        } else if(handle->config.githost == GHOTA_HOST_GITEE){
+            asprintf(&handle->config.hostname, GHOTA_HOSTNAME_GITEE);
+        } else {
+            asprintf(&handle->config.hostname, CONFIG_GITHUB_HOSTNAME);
+        }
+    } else
         asprintf(&handle->config.hostname, newconfig->hostname);
 
-    if (newconfig->orgname == NULL)
-        asprintf(&handle->config.orgname, CONFIG_GITHUB_OWNER);
+    if (newconfig->onwername == NULL)
+        asprintf(&handle->config.onwername, CONFIG_GITHUB_OWNER);
     else
-        asprintf(&handle->config.orgname, newconfig->orgname);
+        asprintf(&handle->config.onwername, newconfig->onwername);
 
     if (newconfig->reponame == NULL)
         asprintf(&handle->config.reponame, CONFIG_GITHUB_REPO);
     else
         asprintf(&handle->config.reponame, newconfig->reponame);
+
+    if (newconfig->userdata == NULL)
+        handle->config.userdata = NULL;
+    else
+        handle->config.userdata = newconfig->userdata;
+
+    if (newconfig->apiurlformatcb == NULL){
+        // Check host platforms
+        if(handle->config.githost == GHOTA_HOST_GITHUB){
+            handle->config.apiurlformatcb = ghota_apiurlformat_github;
+        } else if(handle->config.githost == GHOTA_HOST_GITEE){
+            handle->config.apiurlformatcb = ghota_apiurlformat_gitee;
+        } else {
+            ESP_LOGE(TAG, "Failed to parse current version");
+            ghota_free(handle);
+            xSemaphoreGive(ghota_lock);
+            return NULL;
+        }
+    }
+    else
+        handle->config.apiurlformatcb = newconfig->apiurlformatcb;
+
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
     const esp_app_desc_t *app_desc = esp_app_get_description();
 #else
@@ -146,7 +221,7 @@ esp_err_t ghota_free(ghota_client_handle_t *handle)
         return ESP_FAIL;
     }
     free(handle->config.hostname);
-    free(handle->config.orgname);
+    free(handle->config.onwername);
     free(handle->config.reponame);
     if (handle->username)
         free(handle->username);
@@ -180,10 +255,10 @@ static void lwjson_callback(lwjson_stream_parser_t *jsp, lwjson_stream_type_t ty
     }
     ghota_client_handle_t *handle = (ghota_client_handle_t *)jsp->udata;
 #ifdef DEBUG
-    ESP_LOGI(TAG, "Lwjson Called: %d %d %d %d", jsp->stack_pos, jsp->stack[jsp->stack_pos - 1].type, type, handle->result.flags);
+    ESP_LOGD(TAG, "Lwjson Called: %d %d %d %d", jsp->stack_pos, jsp->stack[jsp->stack_pos - 1].type, type, handle->result.flags);
     if (jsp->stack[jsp->stack_pos - 1].type == LWJSON_STREAM_TYPE_KEY)
     { /* We need key to be before */
-        ESP_LOGI(TAG, "Key: %s", jsp->stack[jsp->stack_pos - 1].meta.name);
+        ESP_LOGD(TAG, "Key: %s", jsp->stack[jsp->stack_pos - 1].meta.name);
     }
 #endif
     /* Get a value corresponsing to "tag_name" key */
@@ -199,47 +274,54 @@ static void lwjson_callback(lwjson_stream_parser_t *jsp, lwjson_stream_type_t ty
             SetFlag(handle, GHOTA_RELEASE_GOT_TAG);
         }
     }
-    if (!GetFlag(handle, GHOTA_RELEASE_VALID_ASSET) || !GetFlag(handle, GHOTA_RELEASE_GOT_STORAGE))
+    if (!GetFlag(handle, GHOTA_RELEASE_GOT_FIRMWARE) || !GetFlag(handle, GHOTA_RELEASE_GOT_STORAGE))
     {
         if (jsp->stack_pos == 5 && jsp->stack[0].type == LWJSON_STREAM_TYPE_OBJECT && jsp->stack[1].type == LWJSON_STREAM_TYPE_KEY && strcasecmp(jsp->stack[1].meta.name, "assets") == 0 && jsp->stack[2].type == LWJSON_STREAM_TYPE_ARRAY && jsp->stack[3].type == LWJSON_STREAM_TYPE_OBJECT && jsp->stack[4].type == LWJSON_STREAM_TYPE_KEY)
         {
             ESP_LOGD(TAG, "Assets Got key '%s' with value '%s'", jsp->stack[jsp->stack_pos - 1].meta.name, jsp->data.str.buff);
+            /* Get Asset Name */
             if (strcasecmp(jsp->stack[4].meta.name, "name") == 0)
             {
                 strncpy(handle->scratch.name, jsp->data.str.buff, CONFIG_MAX_FILENAME_LEN);
                 SetFlag(handle, GHOTA_RELEASE_GOT_FNAME);
-                ESP_LOGD(TAG, "Got Filename for Asset: %s", handle->scratch.name);
+                ESP_LOGI(TAG, "Got Filename for Asset: %s", handle->scratch.name);
             }
-            if (strcasecmp(jsp->stack[4].meta.name, "url") == 0)
+            /* Get Asset Download url */
+            if (strcasecmp(jsp->stack[4].meta.name, "browser_download_url") == 0)
             {
                 strncpy(handle->scratch.url, jsp->data.str.buff, CONFIG_MAX_URL_LEN);
                 SetFlag(handle, GHOTA_RELEASE_GOT_URL);
-                ESP_LOGD(TAG, "Got URL for Asset: %s", handle->scratch.url);
+                ESP_LOGI(TAG, "Got URL for Asset: %s", handle->scratch.url);
             }
             /* Now test if we got both name an download url */
             if (GetFlag(handle, GHOTA_RELEASE_GOT_FNAME) && GetFlag(handle, GHOTA_RELEASE_GOT_URL))
             {
-                ESP_LOGD(TAG, "Testing Firmware filenames %s -> %s - Matching Filename against %s and %s", handle->scratch.name, handle->scratch.url, handle->config.filenamematch, handle->config.storagenamematch);
-                /* see if the filename matches */
-                if (!GetFlag(handle, GHOTA_RELEASE_VALID_ASSET) && fnmatch(handle->config.filenamematch, handle->scratch.name, 0) == 0)
+                ESP_LOGD(TAG, "Testing Asset filenames %s -> %s - Matching Filename against %s and %s", handle->scratch.name, handle->scratch.url, handle->config.firmwarenamematch, handle->config.storagenamematch);
+                /* see if the filename matches firmware name*/
+                if (!GetFlag(handle, GHOTA_RELEASE_GOT_FIRMWARE) && fnmatch(handle->config.firmwarenamematch, handle->scratch.name, 0) == 0)
                 {
-                    strncpy(handle->result.name, handle->scratch.name, CONFIG_MAX_FILENAME_LEN);
-                    strncpy(handle->result.url, handle->scratch.url, CONFIG_MAX_URL_LEN);
-                    ESP_LOGD(TAG, "Valid Firmware Found: %s - %s", handle->result.name, handle->result.url);
-                    SetFlag(handle, GHOTA_RELEASE_VALID_ASSET);
+                    strncpy(handle->result.firmwarename, handle->scratch.name, CONFIG_MAX_FILENAME_LEN);
+                    strncpy(handle->result.firmwareurl, handle->scratch.url, CONFIG_MAX_URL_LEN);
+                    ESP_LOGI(TAG, "Valid Firmware Asset Found: %s - %s", handle->result.firmwarename, handle->result.firmwareurl);
+                    SetFlag(handle, GHOTA_RELEASE_GOT_FIRMWARE);
                 }
+                /* see if the filename matches storage name*/
                 else if (!GetFlag(handle, GHOTA_RELEASE_GOT_STORAGE) && fnmatch(handle->config.storagenamematch, handle->scratch.name, 0) == 0)
                 {
+                    strncpy(handle->result.storagename, handle->scratch.name, CONFIG_MAX_FILENAME_LEN);
                     strncpy(handle->result.storageurl, handle->scratch.url, CONFIG_MAX_URL_LEN);
-                    ESP_LOGD(TAG, "Valid Storage Asset Found: %s - %s", handle->scratch.name, handle->result.storageurl);
+                    ESP_LOGI(TAG, "Valid Storage Asset Found: %s - %s", handle->result.storagename, handle->result.storageurl);
                     SetFlag(handle, GHOTA_RELEASE_GOT_STORAGE);
                 }
                 else
                 {
                     ESP_LOGD(TAG, "Invalid Asset Found: %s", handle->scratch.name);
-                    ClearFlag(handle, GHOTA_RELEASE_GOT_FNAME);
-                    ClearFlag(handle, GHOTA_RELEASE_GOT_URL);
                 }
+
+                handle->scratch.name[0] = '\0';
+                handle->scratch.url[0] = '\0';
+                ClearFlag(handle, GHOTA_RELEASE_GOT_FNAME);
+                ClearFlag(handle, GHOTA_RELEASE_GOT_URL);
             }
         }
     }
@@ -317,7 +399,18 @@ esp_err_t ghota_check(ghota_client_handle_t *handle)
     stream_parser.udata = (void *)handle;
 
     char url[CONFIG_MAX_URL_LEN];
-    snprintf(url, CONFIG_MAX_URL_LEN, "https://%s/repos/%s/%s/releases/latest", handle->config.hostname, handle->config.orgname, handle->config.reponame);
+    esp_err_t err = handle->config.apiurlformatcb(url, CONFIG_MAX_URL_LEN, &handle->config);
+    if (err == ESP_OK && strlen(url) > 0 )
+    {
+        ESP_LOGD(TAG, "Succeed to format git api url = %s", url);
+    }
+    else
+    {
+        ESP_LOGE(TAG, "Failed to format git api url: %s", esp_err_to_name(err));
+        ESP_ERROR_CHECK(esp_event_post(GHOTA_EVENTS, GHOTA_EVENT_NOUPDATE_AVAILABLE, handle, sizeof(ghota_client_handle_t *), portMAX_DELAY));
+        xSemaphoreGive(ghota_lock);
+        return ESP_FAIL;
+    }
 
     esp_http_client_config_t httpconfig = {
         .url = url,
@@ -336,7 +429,7 @@ esp_err_t ghota_check(ghota_client_handle_t *handle)
 
     esp_http_client_handle_t client = esp_http_client_init(&httpconfig);
 
-    esp_err_t err = esp_http_client_perform(client);
+    err = esp_http_client_perform(client);
     if (err == ESP_OK)
     {
         ESP_LOGD(TAG, "HTTP GET Status = %d, content_length = %" PRICONTENT_LENGTH ,
@@ -353,7 +446,7 @@ esp_err_t ghota_check(ghota_client_handle_t *handle)
     }
     if (esp_http_client_get_status_code(client) == 200)
     {
-        if (GetFlag(handle, GHOTA_RELEASE_VALID_ASSET))
+        if (GetFlag(handle, GHOTA_RELEASE_GOT_FIRMWARE) || GetFlag(handle, GHOTA_RELEASE_GOT_STORAGE))
         {
             if (semver_parse(handle->result.tag_name, &handle->latest_version))
             {
@@ -365,16 +458,20 @@ esp_err_t ghota_check(ghota_client_handle_t *handle)
             }
             ESP_LOGI(TAG, "Current Version %d.%d.%d", handle->current_version.major, handle->current_version.minor, handle->current_version.patch);
             ESP_LOGI(TAG, "New Version %d.%d.%d", handle->latest_version.major, handle->latest_version.minor, handle->latest_version.patch);
-            ESP_LOGI(TAG, "Asset: %s", handle->result.name);
-            ESP_LOGI(TAG, "Firmware URL: %s", handle->result.url);
+            if (strlen(handle->result.firmwareurl))
+            {
+                ESP_LOGI(TAG, "Firmware NAME: %s", handle->result.firmwarename);
+                ESP_LOGI(TAG, "Firmware URL: %s", handle->result.firmwareurl);
+            }
             if (strlen(handle->result.storageurl))
             {
+                ESP_LOGI(TAG, "Storage NAME: %s", handle->result.storagename);
                 ESP_LOGI(TAG, "Storage URL: %s", handle->result.storageurl);
             }
         }
         else
         {
-            ESP_LOGI(TAG, "Asset: No Valid Firmware Assets Found");
+            ESP_LOGI(TAG, "Asset: No Valid Assets Found");
             esp_http_client_cleanup(client);
             ESP_ERROR_CHECK(esp_event_post(GHOTA_EVENTS, GHOTA_EVENT_NOUPDATE_AVAILABLE, handle, sizeof(ghota_client_handle_t *), portMAX_DELAY));
             xSemaphoreGive(ghota_lock);
@@ -492,6 +589,123 @@ esp_err_t _http_event_storage_handler(esp_http_client_event_t *evt)
     return ESP_OK;
 }
 
+esp_err_t ghota_firmware_update(ghota_client_handle_t *handle){
+
+    if (xSemaphoreTake(ghota_lock, pdMS_TO_TICKS(1000)) != pdTRUE)
+    {
+        ESP_LOGE(TAG, "Failed to take lock");
+        return ESP_FAIL;
+    }
+    if (handle == NULL)
+    {
+        ESP_LOGE(TAG, "Invalid Handle");
+        xSemaphoreGive(ghota_lock);
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!strlen(handle->result.firmwareurl))
+    {
+        ESP_LOGE(TAG, "No Firmware URL");
+        xSemaphoreGive(ghota_lock);
+        return ESP_FAIL;
+    }
+
+    esp_err_t ota_finish_err = ESP_OK;
+    
+    esp_http_client_config_t httpconfig = {
+        .url = handle->result.firmwareurl,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+        .keep_alive_enable = true,
+        .buffer_size_tx = 4096,
+    };
+
+    if (handle->username)
+    {
+        ESP_LOGD(TAG, "Using Authenticated Request to %s", httpconfig.url);
+        httpconfig.username = handle->username;
+        httpconfig.password = handle->token;
+        httpconfig.auth_type = HTTP_AUTH_TYPE_BASIC;
+    }
+
+    esp_https_ota_config_t ota_config = {
+        .http_config = &httpconfig,
+        .http_client_init_cb = http_client_set_header_cb,
+    };
+
+    esp_https_ota_handle_t https_ota_handle = NULL;
+    esp_err_t err = esp_https_ota_begin(&ota_config, &https_ota_handle);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "ESP HTTPS OTA Begin failed: %d", err);
+        goto fw_ota_end;
+    }
+
+    esp_app_desc_t app_desc;
+    err = esp_https_ota_get_img_desc(https_ota_handle, &app_desc);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "esp_https_ota_read_img_desc failed: %d", err);
+        goto fw_ota_end;
+    }
+    err = validate_image_header(&app_desc);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "image header verification failed: %d", err);
+        goto fw_ota_end;
+    }
+    int last_progress = -1;
+    while (1)
+    {
+        err = esp_https_ota_perform(https_ota_handle);
+        if (err != ESP_ERR_HTTPS_OTA_IN_PROGRESS)
+        {
+            break;
+        }
+        int32_t dl = esp_https_ota_get_image_len_read(https_ota_handle);
+        int32_t size = esp_https_ota_get_image_size(https_ota_handle);
+        int progress = 100 * ((float)dl / (float)size);
+        if ((progress % 5 == 0) && (progress != last_progress))
+        {
+            ESP_ERROR_CHECK(esp_event_post(GHOTA_EVENTS, GHOTA_EVENT_FIRMWARE_UPDATE_PROGRESS, &progress, sizeof(progress), portMAX_DELAY));
+            ESP_LOGV(TAG, "Firmware Update Progress: %d%%", progress);
+            last_progress = progress;
+        }
+    }
+
+    if (esp_https_ota_is_complete_data_received(https_ota_handle) != true)
+    {
+        // the OTA image was not completely received and user can customise the response to this situation.
+        ESP_LOGE(TAG, "Complete data was not received.");
+    }
+    else
+    {
+        ota_finish_err = esp_https_ota_finish(https_ota_handle);
+        if ((err == ESP_OK) && (ota_finish_err == ESP_OK))
+        {
+            ESP_ERROR_CHECK(esp_event_post(GHOTA_EVENTS, GHOTA_EVENT_FINISH_UPDATE, NULL, 0, portMAX_DELAY));
+            xSemaphoreGive(ghota_lock);
+            return ESP_OK;
+        }
+        else
+        {
+            if (ota_finish_err == ESP_ERR_OTA_VALIDATE_FAILED)
+            {
+                ESP_LOGE(TAG, "Image validation failed, image is corrupted");
+            }
+            ESP_LOGE(TAG, "ESP_HTTPS_OTA upgrade failed 0x%x", ota_finish_err);
+            ESP_ERROR_CHECK(esp_event_post(GHOTA_EVENTS, GHOTA_EVENT_UPDATE_FAILED, NULL, 0, portMAX_DELAY));
+            xSemaphoreGive(ghota_lock);
+            return ESP_FAIL;
+        }
+    }
+
+fw_ota_end:
+    esp_https_ota_abort(https_ota_handle);
+    ESP_LOGE(TAG, "ESP_HTTPS_OTA upgrade failed");
+    ESP_ERROR_CHECK(esp_event_post(GHOTA_EVENTS, GHOTA_EVENT_UPDATE_FAILED, NULL, 0, portMAX_DELAY));
+    xSemaphoreGive(ghota_lock);
+    return ESP_FAIL;
+}
+
 esp_err_t ghota_storage_update(ghota_client_handle_t *handle)
 {
     if (xSemaphoreTake(ghota_lock, pdMS_TO_TICKS(1000)) != pdTRUE)
@@ -569,7 +783,6 @@ esp_err_t ghota_storage_update(ghota_client_handle_t *handle)
 
 esp_err_t ghota_update(ghota_client_handle_t *handle)
 {
-    esp_err_t ota_finish_err = ESP_OK;
     if (xSemaphoreTake(ghota_lock, pdMS_TO_TICKS(1000)) != pdTRUE)
     {
         ESP_LOGE(TAG, "Failed to take lock");
@@ -577,7 +790,7 @@ esp_err_t ghota_update(ghota_client_handle_t *handle)
     }
     ESP_LOGI(TAG, "Scheduled Check for Firmware Update Starting");
     ESP_ERROR_CHECK(esp_event_post(GHOTA_EVENTS, GHOTA_EVENT_START_UPDATE, NULL, 0, portMAX_DELAY));
-    if (!GetFlag(handle, GHOTA_RELEASE_VALID_ASSET))
+    if (!GetFlag(handle, GHOTA_RELEASE_GOT_FIRMWARE) && !GetFlag(handle, GHOTA_RELEASE_GOT_STORAGE))
     {
         ESP_LOGE(TAG, "No Valid Release Asset Found");
         ESP_ERROR_CHECK(esp_event_post(GHOTA_EVENTS, GHOTA_EVENT_UPDATE_FAILED, NULL, 0, portMAX_DELAY));
@@ -592,118 +805,44 @@ esp_err_t ghota_update(ghota_client_handle_t *handle)
         xSemaphoreGive(ghota_lock);
         return ESP_OK;
     }
-    esp_http_client_config_t httpconfig = {
-        .url = handle->result.url,
-        .crt_bundle_attach = esp_crt_bundle_attach,
-        .keep_alive_enable = true,
-        .buffer_size_tx = 4096,
-    };
+    xSemaphoreGive(ghota_lock);
 
-    if (handle->username)
-    {
-        ESP_LOGD(TAG, "Using Authenticated Request to %s", httpconfig.url);
-        httpconfig.username = handle->username;
-        httpconfig.password = handle->token;
-        httpconfig.auth_type = HTTP_AUTH_TYPE_BASIC;
-    }
-
-    esp_https_ota_config_t ota_config = {
-        .http_config = &httpconfig,
-        .http_client_init_cb = http_client_set_header_cb,
-    };
-
-    esp_https_ota_handle_t https_ota_handle = NULL;
-    esp_err_t err = esp_https_ota_begin(&ota_config, &https_ota_handle);
-    if (err != ESP_OK)
-    {
-        ESP_LOGE(TAG, "ESP HTTPS OTA Begin failed: %d", err);
-        goto ota_end;
-    }
-
-    esp_app_desc_t app_desc;
-    err = esp_https_ota_get_img_desc(https_ota_handle, &app_desc);
-    if (err != ESP_OK)
-    {
-        ESP_LOGE(TAG, "esp_https_ota_read_img_desc failed: %d", err);
-        goto ota_end;
-    }
-    err = validate_image_header(&app_desc);
-    if (err != ESP_OK)
-    {
-        ESP_LOGE(TAG, "image header verification failed: %d", err);
-        goto ota_end;
-    }
-    int last_progress = -1;
-    while (1)
-    {
-        err = esp_https_ota_perform(https_ota_handle);
-        if (err != ESP_ERR_HTTPS_OTA_IN_PROGRESS)
+    esp_err_t firmware_err = ESP_FAIL;
+    if (GetFlag(handle, GHOTA_RELEASE_GOT_FIRMWARE) && strlen(handle->result.firmwareurl))
+    {   firmware_err = ghota_firmware_update(handle);
+        if (firmware_err == ESP_OK)
         {
-            break;
-        }
-        int32_t dl = esp_https_ota_get_image_len_read(https_ota_handle);
-        int32_t size = esp_https_ota_get_image_size(https_ota_handle);
-        int progress = 100 * ((float)dl / (float)size);
-        if ((progress % 5 == 0) && (progress != last_progress))
-        {
-            ESP_ERROR_CHECK(esp_event_post(GHOTA_EVENTS, GHOTA_EVENT_FIRMWARE_UPDATE_PROGRESS, &progress, sizeof(progress), portMAX_DELAY));
-            ESP_LOGV(TAG, "Firmware Update Progress: %d%%", progress);
-            last_progress = progress;
-        }
-    }
-
-    if (esp_https_ota_is_complete_data_received(https_ota_handle) != true)
-    {
-        // the OTA image was not completely received and user can customise the response to this situation.
-        ESP_LOGE(TAG, "Complete data was not received.");
-    }
-    else
-    {
-        ota_finish_err = esp_https_ota_finish(https_ota_handle);
-        if ((err == ESP_OK) && (ota_finish_err == ESP_OK))
-        {
-            ESP_ERROR_CHECK(esp_event_post(GHOTA_EVENTS, GHOTA_EVENT_FINISH_UPDATE, NULL, 0, portMAX_DELAY));
-            if (strlen(handle->result.storageurl))
-            {
-                xSemaphoreGive(ghota_lock);
-                if (ghota_storage_update(handle) == ESP_OK)
-                {
-                    ESP_LOGI(TAG, "Storage Update Successful");
-                }
-                else
-                {
-                    ESP_LOGE(TAG, "Storage Update Failed");
-                }
-            }
-            else
-            {
-                xSemaphoreGive(ghota_lock);
-            }
-            ESP_LOGI(TAG, "ESP_HTTPS_OTA upgrade successful. Rebooting ...");
-            ESP_ERROR_CHECK(esp_event_post(GHOTA_EVENTS, GHOTA_EVENT_PENDING_REBOOT, NULL, 0, portMAX_DELAY));
-            vTaskDelay(1000 / portTICK_PERIOD_MS);
-            esp_restart();
-            return ESP_OK;
+            ESP_LOGI(TAG, "Firmware Update Successful");
         }
         else
         {
-            if (ota_finish_err == ESP_ERR_OTA_VALIDATE_FAILED)
-            {
-                ESP_LOGE(TAG, "Image validation failed, image is corrupted");
-            }
-            ESP_LOGE(TAG, "ESP_HTTPS_OTA upgrade failed 0x%x", ota_finish_err);
-            ESP_ERROR_CHECK(esp_event_post(GHOTA_EVENTS, GHOTA_EVENT_UPDATE_FAILED, NULL, 0, portMAX_DELAY));
-            xSemaphoreGive(ghota_lock);
-            return ESP_FAIL;
+            ESP_LOGE(TAG, "Firmware Update Failed");
         }
     }
 
-ota_end:
-    esp_https_ota_abort(https_ota_handle);
-    ESP_LOGE(TAG, "ESP_HTTPS_OTA upgrade failed");
-    ESP_ERROR_CHECK(esp_event_post(GHOTA_EVENTS, GHOTA_EVENT_UPDATE_FAILED, NULL, 0, portMAX_DELAY));
-    xSemaphoreGive(ghota_lock);
-    return ESP_FAIL;
+    esp_err_t storage_err = ESP_FAIL;
+    if (GetFlag(handle, GHOTA_RELEASE_GOT_STORAGE) && strlen(handle->result.storageurl))
+    {   storage_err = ghota_storage_update(handle);
+        if (storage_err == ESP_OK)
+        {
+            ESP_LOGI(TAG, "Storage Update Successful");
+        }
+        else
+        {
+            ESP_LOGE(TAG, "Storage Update Failed");
+        }
+    }
+
+    // TODO: Check whether the system need restarts
+    if((GetFlag(handle, GHOTA_RELEASE_GOT_FIRMWARE) && firmware_err == ESP_OK) 
+        || (GetFlag(handle, GHOTA_RELEASE_GOT_STORAGE) && storage_err == ESP_OK)){
+        ESP_LOGI(TAG, "Ghota upgrade successful. Rebooting ...");
+        ESP_ERROR_CHECK(esp_event_post(GHOTA_EVENTS, GHOTA_EVENT_PENDING_REBOOT, NULL, 0, portMAX_DELAY));
+        vTaskDelay(1000 / portTICK_PERIOD_MS);
+        esp_restart();
+    }
+
+    return ESP_OK;
 }
 
 semver_t *ghota_get_current_version(ghota_client_handle_t *handle)
@@ -723,7 +862,7 @@ semver_t *ghota_get_latest_version(ghota_client_handle_t *handle)
     {
         return NULL;
     }
-    if (!GetFlag(handle, GHOTA_RELEASE_VALID_ASSET))
+    if (!GetFlag(handle, GHOTA_RELEASE_GOT_FIRMWARE) && !GetFlag(handle, GHOTA_RELEASE_GOT_STORAGE))
     {
         return NULL;
     }

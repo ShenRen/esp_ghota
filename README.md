@@ -50,7 +50,7 @@ After Initilizing Network Access, Start a timer to periodically check for new re
 
 ```c
     ghota_config_t ghconfig = {
-        .filenamematch = "GithubOTA-esp32.bin", // Glob Pattern to match against the Firmware file
+        .firmwarenamematch = "GithubOTA-esp32.bin", // Glob Pattern to match against the Firmware file
         .storagenamematch = "storage-esp32.bin", // Glob Pattern to match against the storage firmware file
         .storagepartitionname = "storage", // Update the storage partition
         .updateInterval = 60, // Check for updates every 60 minuites
@@ -68,7 +68,7 @@ Manually Checking for updates:
 
 ```c
     ghota_config_t ghconfig = {
-        .filenamematch = "GithubOTA-esp32.bin",
+        .firmwarenamematch = "GithubOTA-esp32.bin",
         .storagenamematch = "storage-esp32.bin",
         .storagepartitionname = "storage",
         .updateInterval = 60,
@@ -99,11 +99,11 @@ Manually Checking for updates:
 ## Configuration
 The following configuration options are available:
 
-    * config.filenamematch <- Glob pattern to match against the firmware file from the Github Releases page. 
+    * config.firmwarenamematch <- Glob pattern to match against the firmware file from the Github Releases page. 
     * config.storagenamematch <- Glob pattern to match against the storage file from the Github Releases page.
     * config.storagepartitionname <- Name of the storage partition to update (as defined in partitions.csv)
     * config.hostname <- Hostname of the Github API (default: api.github.com)
-    * config.orgname <- Name of the Github User or Organization
+    * config.onwername <- Name of the Github User or Organization
     * config.reponame <- Name of the Github Repository
     * config.updateInterval <- Interval in minutes to check for updates
 
@@ -111,7 +111,7 @@ The following configuration options are available:
 The Github Actions included in this repository can be used to build and release firmware images to Github Releases.
 This is a good way to automate your CI/CD pipeline, and update your devices in the field.
 In this example, we build two variants of the Firmware - on for a ESP32 and one for a ESP32-S3 device
-Using the filenamematch and storagenamematch config options, we can match against the correct firmware image for the device.
+Using the firmwarenamematch and storagenamematch config options, we can match against the correct firmware image for the device.
 
 ```yaml
 on:
