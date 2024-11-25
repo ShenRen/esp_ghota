@@ -63,7 +63,8 @@ typedef esp_err_t (*ghota_apiurlformat_callback_fn)(char* url_buf, size_t url_si
 
 typedef struct ghota_asset_t {
     ghota_asset_e type;
-    char namematch[CONFIG_MAX_FILENAME_LEN]; /*!< Filename to match against on Github indicating this is a asset file */
+    char nameformat[CONFIG_MAX_FILENAME_LEN]; /*!< Filename to match against on Github indicating this is a asset file */
+    semver_t version; /*!< Version of the asset */
     union {
         char filedirpath[CONFIG_MAX_FILENAME_LEN]; /*!< Directory path for a data file */
         char partitionname[17]; /*!< Name of the storage partition to update */
@@ -74,7 +75,7 @@ typedef struct ghota_asset_t {
  * @brief Get Asset Version
  * The callback function is used to determine the version of the asset
  */
-typedef esp_err_t (*ghota_getversion_callback_fn)(char* ver_buf, size_t ver_size, const ghota_asset_t * asset, const struct ghota_config_t * ghota_config);
+typedef esp_err_t (*ghota_getversion_callback_fn)(semver_t* version, const ghota_asset_t * asset, const struct ghota_config_t * ghota_config);
 
 
 /**

@@ -1,5 +1,6 @@
 #include <stdlib.h>
 #include <fnmatch.h>
+#include <dirent.h>
 #include <libgen.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -20,6 +21,12 @@
 #define GHOTA_HOSTNAME_GITHUB "api.github.com"
 #define GHOTA_HOSTNAME_GITEE "gitee.com"
 
+#define GHOTA_STORAGE_VER_FILE   "version.ota"
+#define GHOTA_STORAGE_VER_FORMAT "version: %s"
+#define GHOTA_STORAGE_VER_HIT   "# This file is used by the build system to generate the ota package.\n" \
+                                "# It contains the versioning information for the storage package.\n" \
+                                "# Please do not modify this file directly.\n"
+
 static const char *TAG = "GHOTA";
 
 ESP_EVENT_DEFINE_BASE(GHOTA_EVENTS);
@@ -34,6 +41,7 @@ typedef struct ghota_asset_result_t{
     char name[CONFIG_MAX_FILENAME_LEN];
     char url[CONFIG_MAX_URL_LEN];
     size_t size;
+    semver_t version;
 } ghota_asset_result_t;
 
 
@@ -109,25 +117,155 @@ static esp_err_t ghota_apiurlformat_gitee(char* url_buf, size_t url_size, const 
     return ESP_OK;
 }
 
-static esp_err_t ghota_getversion(char* ver_buf, size_t ver_size, const ghota_asset_t * asset, const struct ghota_config_t * ghota_config){
-    if(asset->type == GHOTA_ASSET_FIRMWARE){
+static esp_err_t ghota_get_firmware_version(semver_t* version){
+    bzero(version, sizeof(semver_t));
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
-        const esp_app_desc_t *app_desc = esp_app_get_description();
+    const esp_app_desc_t *app_desc = esp_app_get_description();
 #else
-        const esp_app_desc_t *app_desc = esp_ota_get_app_description();
+    const esp_app_desc_t *app_desc = esp_ota_get_app_description();
 #endif
-        strncpy(ver_buf,app_desc->version,ver_size);
-        return ESP_OK;
+    if (semver_parse(app_desc->version, version)){
+        ESP_LOGE(TAG, "Failed to parse firmware version");
+        return ESP_FAIL;
     }
 
+    ESP_LOGI(TAG, "Get firmware version v" SEMVER_FORMAT, SEMVER_ARGV(*version));
+    return ESP_OK;
+}
+
+static esp_err_t ghota_set_storage_version(semver_t* version){
+    // Read storage version.ota file and parse it
+    ESP_LOGI(TAG, "Writting " GHOTA_STORAGE_VER_FILE);
+    // Open for reading hello.txt
+    FILE* f = fopen("/spiffs/" GHOTA_STORAGE_VER_FILE, "w");
+    if (f == NULL) {
+        ESP_LOGE(TAG, "Failed to open /spiffs/" GHOTA_STORAGE_VER_FILE);
+        return ESP_FAIL;
+    }
+    int ret = fprintf(f, "version: v" SEMVER_FORMAT, SEMVER_ARGV(*version));
+    // Display the read contents from the file
+    ESP_LOGI(TAG, "Write 'version: v" SEMVER_FORMAT "'", SEMVER_ARGV(*version));
+    fclose(f);
+    
+    if(ret <= 0) {
+        ESP_LOGE(TAG, "Failed to write " GHOTA_STORAGE_VER_FILE " : %d", ret);
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(TAG, "set storage version v" SEMVER_FORMAT, SEMVER_ARGV(*version));
+    return ESP_OK;
+}
+
+static esp_err_t ghota_get_storage_version(semver_t* version){
+    bzero(version, sizeof(semver_t));
+    // Read storage version.ota file and parse it
+    ESP_LOGI(TAG, "Reading " GHOTA_STORAGE_VER_FILE);
+    // Open for reading hello.txt
+    FILE* f = fopen("/spiffs/" GHOTA_STORAGE_VER_FILE, "r");
+    if (f == NULL) {
+        ESP_LOGE(TAG, "Failed to open " GHOTA_STORAGE_VER_FILE);
+        return ESP_FAIL;
+    }
+    char ver_str[64] = {0};
+    int ret = fscanf(f, GHOTA_STORAGE_VER_FORMAT "\n" , ver_str);
+    fscanf(f, GHOTA_STORAGE_VER_HIT);
+    // Display the read contents from the file
+    ESP_LOGI(TAG, "Read from " GHOTA_STORAGE_VER_FILE ": %s", ver_str);
+    fclose(f);
+    
+    if(ret != 1) {
+        ESP_LOGE(TAG, "Failed to read " GHOTA_STORAGE_VER_FILE " : %d", ret);
+        return ESP_FAIL;
+    }
+    if (semver_parse(ver_str, version)){
+        ESP_LOGE(TAG, "Failed to parse storage version");
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(TAG, "Get storage version v" SEMVER_FORMAT, SEMVER_ARGV(*version));
+    return ESP_OK;
+}
+
+static esp_err_t ghota_get_version_by_filename(semver_t* version, const char* filename, const char* nameformat){
+    bzero(version, sizeof(semver_t));
+    char ver_str[64] = {0};
+    int ret = sscanf(filename, nameformat, ver_str);
+    if (ret != 1 || semver_parse(ver_str, version)){
+        ESP_LOGE(TAG, "Failed to parse File version");
+        return ESP_FAIL;
+    }
+    
+    ESP_LOGI(TAG, "Get file version v" SEMVER_FORMAT, SEMVER_ARGV(*version));
+    return ESP_OK;
+}
+
+static esp_err_t ghota_get_file_version_by_dir(semver_t* version, const char* dirpath, const char* nameformat){
+    // Traverse the file directory to find files that meet the requirements
+
+    DIR *dir;
+    struct dirent *entry;
+    // Open the directory
+    dir = opendir(dirpath);
+    if (dir == NULL) {
+        ESP_LOGE(TAG, "Failed to open directory %s", dirpath);
+        return ESP_FAIL;
+    }
+    char ver_str[64] = {0};
+    semver_t file_ver[2] = {0};
+    int temp_idx = 0;
+    int newest_idx = 1;
+    bool find_newest = false;
+    
+    char namematch[CONFIG_MAX_FILENAME_LEN] = {0};
+    sprintf(namematch, nameformat, "*");
+    // Read each entry in the directory
+    while ((entry = readdir(dir)) != NULL) {
+        // Skip the current directory and parent directory
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+            continue;
+        }
+        // Check if the file name matches the name to be matched
+        if(fnmatch(namematch, entry->d_name, 0) == 0){
+            ESP_LOGI(TAG, "Found file %s", entry->d_name);
+            int ret = sscanf(entry->d_name, nameformat, ver_str);
+            if (ret != 1 || semver_parse(ver_str, &file_ver[temp_idx])){
+                ESP_LOGE(TAG, "Failed to parse File version");
+                continue;
+            }
+            if(semver_compare(file_ver[newest_idx], file_ver[temp_idx]) < 0){
+                semver_free(&file_ver[newest_idx]);
+                newest_idx = temp_idx;
+                temp_idx = (temp_idx + 1) % 2;
+                find_newest = true;
+            } else {
+                semver_free(&file_ver[temp_idx]);
+            }
+        }
+    }
+    //Close the directory
+    closedir(dir);
+
+    if(find_newest){
+        *version = file_ver[newest_idx];
+        ESP_LOGI(TAG, "Get file version v" SEMVER_FORMAT, SEMVER_ARGV(*version));
+        return ESP_OK;
+    }
     return ESP_FAIL;
 }
 
-
+static esp_err_t ghota_getversion(semver_t* version, const ghota_asset_t * asset, const struct ghota_config_t * ghota_config){
+    if(asset->type == GHOTA_ASSET_FIRMWARE){
+        return ghota_get_firmware_version(version);
+    } else if(asset->type == GHOTA_ASSET_STORAGE){
+        return ghota_get_storage_version(version);
+    } else if(asset->type == GHOTA_ASSET_FILE){
+        return ghota_get_file_version_by_dir(version, asset->filedirpath, asset->nameformat);
+    }
+    return ESP_FAIL;
+}
 
 ghota_client_handle_t *ghota_init(ghota_config_t *newconfig)
 {
-
     if(!newconfig->assets || !newconfig->assetssize){
         ESP_LOGE(TAG, "No assets is provided.");
         return NULL;
@@ -138,7 +276,7 @@ ghota_client_handle_t *ghota_init(ghota_config_t *newconfig)
     size_t storage_num = 0;
     size_t file_num = 0;
     for(int i = 0; i < newconfig->assetssize ; i++){
-        if(strlen(newconfig->assets[i].namematch) == 0){
+        if(strlen(newconfig->assets[i].nameformat) == 0){
             ESP_LOGE(TAG, "Asset[%d] not specify name match.",i);
             return NULL;
         }
@@ -266,17 +404,19 @@ ghota_client_handle_t *ghota_init(ghota_config_t *newconfig)
     else
         handle->config.apiurlformatcb = newconfig->apiurlformatcb;
 
-#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
-    const esp_app_desc_t *app_desc = esp_app_get_description();
-#else
-    const esp_app_desc_t *app_desc = esp_ota_get_app_description();
-#endif
-    if (semver_parse(app_desc->version, &handle->current_version))
+    handle->result.flags = 0;
+
+    if (ghota_get_firmware_version(&handle->current_version) != ESP_OK)
     {
         ESP_LOGE(TAG, "Failed to parse current version");
         goto init_err;
     }
-    handle->result.flags = 0;
+
+    // Determine the versions of all assets
+    for(int i = 0; i < newconfig->assetssize ; i++){
+        handle->config.getversioncb(&handle->config.assets[i].version,&handle->config.assets[i],&handle->config);
+    }
+
 
     //    if (newconfig->updateInterval < 60) {
     //        ESP_LOGE(TAG, "Update interval must be at least 60 Minutes");
@@ -303,8 +443,6 @@ esp_err_t ghota_free(ghota_client_handle_t *handle)
         return ESP_FAIL;
     }
 
-    if (handle->result.assets)
-            free(handle->result.assets);
     free(handle->config.hostname);
     free(handle->config.onwername);
     free(handle->config.reponame);
@@ -323,6 +461,14 @@ esp_err_t ghota_free(ghota_client_handle_t *handle)
         free(handle->result.change_log);
     if (handle->result.release_date)
         free(handle->result.release_date);
+
+    for(int i = 0; i < handle->config.assetssize; i++){
+        semver_free(&handle->config.assets[i].version);
+        semver_free(&handle->result.assets[i].version);
+    }
+
+    if (handle->result.assets)
+        free(handle->result.assets);
 
     xSemaphoreGive(ghota_lock);
     vSemaphoreDelete(ghota_lock);
@@ -470,42 +616,50 @@ static void _lwjson_laste_callback(lwjson_stream_parser_t *jsp, lwjson_stream_ty
             ghota_asset_result_t * result;
             ghota_asset_result_t * scratch = &handle->scratch;
             bool asset_find = false;
+            char namematch[CONFIG_MAX_FILENAME_LEN] = {0};
             
             for(int i = 0;i < handle->config.assetssize; i++)
             {
                 asset = &handle->config.assets[i];
                 result = &handle->result.assets[i];
+                sprintf(namematch, asset->nameformat, "*");
 
-                ESP_LOGD(TAG, "Testing Asset filenames %s  - Matching Filename %s", handle->scratch.name, asset->namematch);
+                ESP_LOGD(TAG, "Testing Asset filenames %s  - Matching Filename %s", handle->scratch.name, asset->nameformat);
 
                 /* see if the filename matches firmware name*/
-                if (!GetFlag(handle, GHOTA_RELEASE_GOT_FIRMWARE) && asset->type == GHOTA_ASSET_FIRMWARE 
-                    && fnmatch(asset->namematch, scratch->name, 0) == 0)
+                if (!GetFlag(handle, GHOTA_RELEASE_GOT_FIRMWARE) && asset->type == GHOTA_ASSET_FIRMWARE
+                    && fnmatch(namematch, scratch->name, 0) == 0)
                 {
                     strncpy(result->name, scratch->name, CONFIG_MAX_FILENAME_LEN);
                     strncpy(result->url, scratch->url, CONFIG_MAX_URL_LEN);
-                    ESP_LOGI(TAG, "Valid Firmware Asset Found: %s - %s", result->name, result->url);
+                    ghota_get_version_by_filename(&result->version, result->name, asset->nameformat);
+                    ESP_LOGI(TAG, "Valid Firmware v" SEMVER_FORMAT " Asset Found: %s - %s", 
+                        SEMVER_ARGV(result->version), result->name, result->url);
                     SetFlag(handle, GHOTA_RELEASE_GOT_FIRMWARE);
                     asset_find = true;
                     break;
                 }
                 /* see if the filename matches storage name*/
                 else if (!GetFlag(handle, GHOTA_RELEASE_GOT_STORAGE) && asset->type == GHOTA_ASSET_STORAGE 
-                    && fnmatch(asset->namematch, scratch->name, 0) == 0)
+                    && fnmatch(namematch, scratch->name, 0) == 0)
                 {
                     strncpy(result->name, scratch->name, CONFIG_MAX_FILENAME_LEN);
                     strncpy(result->url, scratch->url, CONFIG_MAX_URL_LEN);
-                    ESP_LOGI(TAG, "Valid Storage Asset Found: %s - %s", result->name, result->url);
+                    ghota_get_version_by_filename(&result->version, result->name, asset->nameformat);
+                    ESP_LOGI(TAG, "Valid Storage v" SEMVER_FORMAT " Asset Found: %s - %s", 
+                        SEMVER_ARGV(result->version), result->name, result->url);
                     SetFlag(handle, GHOTA_RELEASE_GOT_STORAGE);
                     asset_find = true;
                     break;
                 }
                 /* see if the filename matches file name*/
-                else if(fnmatch(asset->namematch, scratch->name, 0) == 0)
+                else if(fnmatch(namematch, scratch->name, 0) == 0)
                 {
                     strncpy(result->name, scratch->name, CONFIG_MAX_FILENAME_LEN);
                     strncpy(result->url, scratch->url, CONFIG_MAX_URL_LEN);
-                    ESP_LOGI(TAG, "Valid File Asset Found: %s - %s", result->name, result->url);
+                    ghota_get_version_by_filename(&result->version, result->name, asset->nameformat);
+                    ESP_LOGI(TAG, "Valid File v" SEMVER_FORMAT " Asset Found: %s - %s", 
+                        SEMVER_ARGV(result->version), result->name, result->url);
                     SetFlag(handle, GHOTA_RELEASE_GOT_FILE);
                     asset_find = true;
                     break;
@@ -1038,9 +1192,15 @@ esp_err_t ghota_storage_update(ghota_client_handle_t *handle, uint32_t asset_idx
         uint8_t sha256[32] = {0};
         ESP_ERROR_CHECK(esp_partition_get_sha256(handle->storage_partition, sha256));
         ESP_LOG_BUFFER_HEX("New Storage Partition SHA256:", sha256, sizeof(sha256));
+
         ESP_ERROR_CHECK(esp_event_post(GHOTA_EVENTS, GHOTA_EVENT_FINISH_STORAGE_UPDATE, NULL, 0, portMAX_DELAY));
         /* give time for the system to react, such as unmounting the filesystems etc */
         vTaskDelay(pdMS_TO_TICKS(1000));
+
+        // After Storage mounted
+        // Create/open a Storage version file
+        ghota_set_storage_version(&handle->result.assets[asset_idx].version);
+
     }
     else
     {
@@ -1078,12 +1238,13 @@ esp_err_t ghota_file_update(ghota_client_handle_t *handle, uint32_t asset_idx)
         return ESP_FAIL;
     }
 
-    // Create/open asset file
-    char file_name[CONFIG_MAX_FILENAME_LEN];
-    snprintf(file_name,CONFIG_MAX_FILENAME_LEN,"%s/%s", handle->config.assets[asset_idx].filedirpath ,handle->result.assets[asset_idx].name);
-    handle->file_handle = fopen(file_name, "w");
+    // Create/open asset temp file
+    char file_temp_name[CONFIG_MAX_FILENAME_LEN];
+    snprintf(file_temp_name,CONFIG_MAX_FILENAME_LEN,"%s/%s.tmp", handle->config.assets[asset_idx].filedirpath ,handle->result.assets[asset_idx].name);
+    ESP_LOGI(TAG, "Create/open asset temp file %s", file_temp_name);
+    handle->file_handle = fopen(file_temp_name, "w");
     if (handle->file_handle == NULL) {
-        ESP_LOGE(TAG, "Failed to open/create asset file:%s", file_name); // TODO: 打开文件出错
+        ESP_LOGE(TAG, "Failed to open/create asset temp file:%s", file_temp_name); // TODO: 打开文件出错
         ESP_ERROR_CHECK(esp_event_post(GHOTA_EVENTS, GHOTA_EVENT_FILE_UPDATE_FAILED, NULL, 0, portMAX_DELAY));
         xSemaphoreGive(ghota_lock);
         return ESP_FAIL;
@@ -1122,6 +1283,11 @@ esp_err_t ghota_file_update(ghota_client_handle_t *handle, uint32_t asset_idx)
         // ESP_ERROR_CHECK(esp_partition_get_sha256(handle->storage_partition, sha256));
         // ESP_LOG_BUFFER_HEX("New Storage Partition SHA256:", sha256, sizeof(sha256));
 
+        // Rename asset file to real name
+        char file_name[CONFIG_MAX_FILENAME_LEN];
+        snprintf(file_name,CONFIG_MAX_FILENAME_LEN,"%s/%s", handle->config.assets[asset_idx].filedirpath ,handle->result.assets[asset_idx].name);
+        ESP_LOGI(TAG, "Rename asset temp file to %s", file_name);
+        rename(file_temp_name, file_name);
         // Close asset file
         fclose(handle->file_handle);
         handle->file_handle = NULL;
@@ -1134,7 +1300,7 @@ esp_err_t ghota_file_update(ghota_client_handle_t *handle, uint32_t asset_idx)
         // delete asset file
         fclose(handle->file_handle);
         handle->file_handle = NULL;
-        remove(file_name);
+        remove(file_temp_name);
         ESP_LOGE(TAG, "HTTP GET request failed: %s", esp_err_to_name(err));
         ESP_ERROR_CHECK(esp_event_post(GHOTA_EVENTS, GHOTA_EVENT_FILE_UPDATE_FAILED, NULL, 0, portMAX_DELAY));
     }
@@ -1159,44 +1325,74 @@ esp_err_t ghota_update(ghota_client_handle_t *handle)
         xSemaphoreGive(ghota_lock);
         return ESP_FAIL;
     }
+    // Check if latest version is newer than current version
     int cmp = semver_compare_version(handle->latest_version, handle->current_version);
-    if (cmp != 1)
+    if (cmp < 0)
     {
-        ESP_LOGE(TAG, "Current Version is equal or newer than new release");
+        ESP_LOGE(TAG, "Current Version is newer than new release");
         ESP_ERROR_CHECK(esp_event_post(GHOTA_EVENTS, GHOTA_EVENT_FIRMWARE_UPDATE_FAILED, NULL, 0, portMAX_DELAY));
         xSemaphoreGive(ghota_lock);
         return ESP_OK;
+    } 
+    else if (cmp >= 0)
+    {
+        if(cmp == 0)
+            ESP_LOGW(TAG, "Current Version is equal to new release, Check storage and file update or integrity");
+        else
+            ESP_LOGI(TAG, "Current Version is less than new release, Starting Update");
     }
     xSemaphoreGive(ghota_lock);
 
     esp_err_t firmware_err = ESP_FAIL;
     esp_err_t storage_err = ESP_FAIL;
+    bool has_error = false;
 
     for(int i = 0; i < handle->config.assetssize; i++){
         ghota_asset_t * asset = &handle->config.assets[i];
         ghota_asset_result_t * result = &handle->result.assets[i];
         handle->result_curr_idx = i;
-        ESP_LOGI(TAG, "Update asset[%d], %s",i,result->name);
+        ESP_LOGI(TAG, "Update asset[%d] v" SEMVER_FORMAT ", %s", i , SEMVER_ARGV(asset->version), asset->nameformat);
+        ESP_LOGI(TAG, "Update result[%d] v" SEMVER_FORMAT ", %s", i , SEMVER_ARGV(result->version), result->name);
         if (asset->type == GHOTA_ASSET_FIRMWARE && GetFlag(handle, GHOTA_RELEASE_GOT_FIRMWARE) && strlen(result->url)){
+            // Check if the firmware is newer than current running firmware
+
+            if(semver_compare_version(result->version,asset->version) < 1){
+                // skip frimware update
+                ESP_LOGI(TAG, "Firmware Version is equal or newer than latest version, skip update");
+                continue;
+            }
             firmware_err = ghota_firmware_update(handle,i);
             if (firmware_err == ESP_OK){
                 ESP_LOGI(TAG, "Firmware Update Successful");
             } else {
                 ESP_LOGE(TAG, "Firmware Update Failed");
+                has_error = true;
             }
         } else if (asset->type == GHOTA_ASSET_STORAGE && GetFlag(handle, GHOTA_RELEASE_GOT_STORAGE) && strlen(result->url)){
+            if(semver_compare_version(result->version,asset->version) < 1){
+                // skip frimware update
+                ESP_LOGI(TAG, "Storage [%s] Version is equal or newer than latest version, skip update",asset->partitionname);
+                continue;
+            }
             storage_err = ghota_storage_update(handle,i);
             if (storage_err == ESP_OK){
                 ESP_LOGI(TAG, "Storage [%s] Update Successful",asset->partitionname);
             } else {
                 ESP_LOGE(TAG, "Storage [%s] Update Failed",asset->partitionname);
+                has_error = true;
             }
         } else if (asset->type == GHOTA_ASSET_FILE && GetFlag(handle, GHOTA_RELEASE_GOT_FILE) && strlen(result->url)){
+            if(semver_compare_version(result->version,asset->version) < 1){
+                // skip frimware update
+                ESP_LOGI(TAG, "File [%d] current Version is equal or newer than latest version, skip update", i);
+                continue;
+            }
             storage_err = ghota_file_update(handle,i);
             if (storage_err == ESP_OK){
                 ESP_LOGI(TAG, "File Update Successful: %s", result->name);
             } else {
                 ESP_LOGE(TAG, "File Update Failed: %s", result->name);
+                has_error = true;
             }
         }
     }

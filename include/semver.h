@@ -16,6 +16,13 @@ extern "C" {
 #define SEMVER_VERSION "0.2.0"
 #endif
 
+// #define SEMVER_FORMAT "%d.%d.%d%s%s"
+// #define SEMVER_ARGV(ver) (ver).major, (ver).minor, (ver).patch, (strlen((ver).prerelease)>0?"-":""), (strlen((ver).prerelease)>0?(ver).prerelease:"")
+
+#define SEMVER_FORMAT "%d.%d.%d"
+#define SEMVER_ARGV(ver) (ver).major, (ver).minor, (ver).patch
+
+
 /**
  * semver_t struct
  */

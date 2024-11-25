@@ -18,7 +18,8 @@ Automate your OTA and CI/CD pipeline with Github Actions to update your ESP32 de
 * Sends progress of Updates via the esp_event_loop
 * Supports multiple git platforms (github, gitee, gitlab, etc)
 * Supports multiple files to update (firmware, spiffs, files, etc)
-* Get more informa from Git API (Release name, Date, Change log, Prerelease, etc),
+* Get more informa from Git API (Release name, Date, Change log, Prerelease, etc)
+* Supports firmware, storage, file version checking, and integrity checking
 
 Note:
 You should be careful with your GitHub PAT and putting it in the source code. I would suggest that you store the PAT in NVS, and the user enters it when running, as otherwise the PAT would be easily extractable from your firmware images. 
