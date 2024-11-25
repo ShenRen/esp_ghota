@@ -16,6 +16,9 @@ Automate your OTA and CI/CD pipeline with Github Actions to update your ESP32 de
 * Supports Github Enterprise
 * Supports Github Personal Access Tokens to overcome Github API Ratelimits
 * Sends progress of Updates via the esp_event_loop
+* Supports multiple git platforms (github, gitee, gitlab, etc)
+* Supports multiple files to update (firmware, spiffs, files, etc)
+* Get more informa from Git API (Release name, Date, Change log, Prerelease, etc),
 
 Note:
 You should be careful with your GitHub PAT and putting it in the source code. I would suggest that you store the PAT in NVS, and the user enters it when running, as otherwise the PAT would be easily extractable from your firmware images. 
@@ -25,7 +28,7 @@ You should be careful with your GitHub PAT and putting it in the source code. I 
 ### esp-idf via Espressif Component Registry:
 
 ```bash
-idf.py add-dependency Fishwaldo/ghota^1.0.0
+idf.py add-dependency Fishwaldo/ghota^1.3.0
 ```
 
 #### Platform IO Registry:
@@ -34,7 +37,7 @@ add this to your platform.ini file:
 
 ```ini 
 lib_deps = 
-    fishwaldo/ghota@^1.0.0
+    fishwaldo/ghota@^1.3.0
 ```
 
 You also need to copy the contents of [Kconfig](Kconfig) into your project's Kconfig file, and run pio run -t menuconfig to configure the component.

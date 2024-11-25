@@ -11,4 +11,4 @@ idf_component_register(SRCS "${srcs}"
                     PRIV_REQUIRES ${priv_requires}
                     REQUIRES ${requires})
 
-set_source_files_properties("src/esp_ghota.c"  COMPILE_FLAGS "-Wno-stringop-truncation")
+set_source_files_properties("src/esp_ghota.c"  COMPILE_FLAGS "-Wno-stringop-truncation -Wno-format-truncation")

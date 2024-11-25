@@ -20,15 +20,19 @@ typedef enum
     GHOTA_EVENT_START_CHECK = 0x01,    /*!< Github OTA check started */
     GHOTA_EVENT_UPDATE_AVAILABLE = 0x02,   /*!< Github OTA update available */
     GHOTA_EVENT_NOUPDATE_AVAILABLE = 0x04, /*!< Github OTA no update available */
-    GHOTA_EVENT_START_UPDATE = 0x08,  /*!< Github OTA update started */
-    GHOTA_EVENT_FINISH_UPDATE = 0x10, /*!< Github OTA update finished */
-    GHOTA_EVENT_UPDATE_FAILED = 0x20, /*!< Github OTA update failed */
+    GHOTA_EVENT_START_FIRMWARE_UPDATE = 0x08,  /*!< Github OTA firmware update started */
+    GHOTA_EVENT_FINISH_FIRMWARE_UPDATE = 0x10, /*!< Github OTA firmware update finished */
+    GHOTA_EVENT_FIRMWARE_UPDATE_FAILED = 0x20, /*!< Github OTA firmware update failed */
     GHOTA_EVENT_START_STORAGE_UPDATE = 0x40, /*!< Github OTA storage update started. If the storage is mounted, you should unmount it when getting this call */
     GHOTA_EVENT_FINISH_STORAGE_UPDATE = 0x80, /*!< Github OTA storage update finished. You can mount the new storage after getting this call if needed */
     GHOTA_EVENT_STORAGE_UPDATE_FAILED = 0x100, /*!< Github OTA storage update failed */
-    GHOTA_EVENT_FIRMWARE_UPDATE_PROGRESS = 0x200, /*!< Github OTA firmware update progress */
-    GHOTA_EVENT_STORAGE_UPDATE_PROGRESS = 0x400, /*!< Github OTA storage update progress */
-    GHOTA_EVENT_PENDING_REBOOT = 0x800, /*!< Github OTA pending reboot */
+    GHOTA_EVENT_START_FILE_UPDATE = 0x200,  /*!< Github OTA file update started */
+    GHOTA_EVENT_FINISH_FILE_UPDATE = 0x400, /*!< Github OTA file update finished */
+    GHOTA_EVENT_FILE_UPDATE_FAILED = 0x800, /*!< Github OTA file update failed */
+    GHOTA_EVENT_FIRMWARE_UPDATE_PROGRESS = 0x1000, /*!< Github OTA firmware update progress */
+    GHOTA_EVENT_STORAGE_UPDATE_PROGRESS = 0x2000, /*!< Github OTA storage update progress */
+    GHOTA_EVENT_FILE_UPDATE_PROGRESS = 0x4000, /*!< Github OTA file update progress */
+    GHOTA_EVENT_PENDING_REBOOT = 0x8000, /*!< Github OTA pending reboot */
 } ghota_event_e;
 
 /** 
@@ -42,16 +46,44 @@ typedef enum
     GHOTA_HOST_GITEE = 0x02, /*!< Gitee, Git-based code hosting and R&D collaboration platform*/
 } ghota_host_e;
 
+typedef enum
+{
+    GHOTA_ASSET_FIRMWARE = 0x00, /*!< Firmware asset, Only Zero or One allowed*/
+    GHOTA_ASSET_STORAGE = 0x01, /*!< Storage asset， Only Zero or One allowed*/
+    GHOTA_ASSET_FILE = 0x02, /*!< File assets，Unlimited num*/
+} ghota_asset_e;
+
 struct ghota_config_t;
+
+/** 
+ * @brief Format the Git API Url
+ * The callback function is used to format the Git API Url
+ */
 typedef esp_err_t (*ghota_apiurlformat_callback_fn)(char* url_buf, size_t url_size, const struct ghota_config_t * ghota_config);
+
+typedef struct ghota_asset_t {
+    ghota_asset_e type;
+    char namematch[CONFIG_MAX_FILENAME_LEN]; /*!< Filename to match against on Github indicating this is a asset file */
+    union {
+        char filedirpath[CONFIG_MAX_FILENAME_LEN]; /*!< Directory path for a data file */
+        char partitionname[17]; /*!< Name of the storage partition to update */
+    };
+} ghota_asset_t;
+
+/** 
+ * @brief Get Asset Version
+ * The callback function is used to determine the version of the asset
+ */
+typedef esp_err_t (*ghota_getversion_callback_fn)(char* ver_buf, size_t ver_size, const ghota_asset_t * asset, const struct ghota_config_t * ghota_config);
+
 
 /**
  * @brief Github OTA Configuration
  */
 typedef struct ghota_config_t {
-    char firmwarenamematch[CONFIG_MAX_FILENAME_LEN]; /*!< Filename to match against on Github indicating this is a firmware file */
-    char storagenamematch[CONFIG_MAX_FILENAME_LEN]; /*!< Filename to match against on Github indicating this is a storage file */
-    char storagepartitionname[17]; /*!< Name of the storage partition to update */
+    ghota_asset_t * assets; /*!< Assets that need to be updated */
+    size_t assetssize; /*!< number of assets*/
+    ghota_getversion_callback_fn getversioncb; /*!< Callback function to determine the version of the asset*/
     ghota_host_e githost; /*!< Git hosting platform*/
     char *hostname; /*!< Hostname of the Github server. Defaults to api.github.com*/
     char *onwername; /*!< Name of the Github onwer or organization */
@@ -165,6 +197,46 @@ esp_err_t ghota_start_update_timer(ghota_client_handle_t *handle);
  * @return char* a string representing the event
  */
 char *ghota_get_event_str(ghota_event_e event);
+
+/**
+ * @brief Check if the latest release is a prerelease
+ * @note Only valid after event GHOTA_EVENT_UPDATE_AVAILABLE
+ * 
+ * @return true if the latest release is a prerelease, false otherwise
+ */
+bool ghota_is_prerelease(ghota_client_handle_t *handle);
+
+/**
+ * @brief Get the tag name of the latest release
+ * @note Only valid after event GHOTA_EVENT_UPDATE_AVAILABLE
+ * 
+ * @return const char* the tag name of the latest release
+ */
+const char* ghota_get_tag_name(ghota_client_handle_t *handle);
+
+/**
+ * @brief Get the name of the latest release
+ * @note Only valid after event GHOTA_EVENT_UPDATE_AVAILABLE
+ * 
+ * @return const char* the name of the latest release
+ */
+const char* ghota_get_release_name(ghota_client_handle_t *handle);
+
+/**
+ * @brief Get the changelog of the latest release
+ * @note Only valid after event GHOTA_EVENT_UPDATE_AVAILABLE
+ * 
+ * @return const char* the changelog of the latest release
+ */
+const char* ghota_get_change_log(ghota_client_handle_t *handle);
+
+/**
+ * @brief Get the release date of the latest release
+ * @note Only valid after event GHOTA_EVENT_UPDATE_AVAILABLE
+ * 
+ * @return const char* the release date of the latest release
+ */
+const char* ghota_get_release_date(ghota_client_handle_t *handle);
 
 
 #ifdef __cplusplus
